@@ -123,15 +123,37 @@ export async function sendChatAction(input: ChatInput): Promise<{ reply: string 
     { role: "user", parts: [{ text: input.text }] },
   ];
 
-  try {
-    const ai = new GoogleGenAI({ apiKey: key });
-    const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-    const response = await ai.models.generateContent({ model, contents, config: { systemInstruction: system, temperature: 0.8 } });
-    return { reply: response.text?.trim() || null };
-  } catch (e) {
-    console.error("[sendChat]", e);
-    return { reply: null };
+  const ai = new GoogleGenAI({ apiKey: key });
+  // Try the configured model first, then progressively cheaper/less-loaded
+  // fallbacks. Each model is retried a couple of times on transient overload.
+  const preferred = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  const models = [...new Set([preferred, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"])];
+
+  const isTransient = (e: unknown): boolean => {
+    const err = e as { status?: number; message?: string };
+    const msg = (err?.message || "").toLowerCase();
+    return err?.status === 503 || err?.status === 429 ||
+      msg.includes("unavailable") || msg.includes("overloaded") || msg.includes("high demand") || msg.includes("rate");
+  };
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  for (const model of models) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await ai.models.generateContent({ model, contents, config: { systemInstruction: system, temperature: 0.8 } });
+        const reply = response.text?.trim();
+        if (reply) return { reply };
+        break; // empty reply → try next model
+      } catch (e) {
+        if (isTransient(e) && attempt < 2) { await sleep(500 * (attempt + 1)); continue; }
+        if (isTransient(e)) break; // exhausted retries for this model → next model
+        console.error("[sendChat]", e);
+        return { reply: null }; // non-transient (bad key, etc.)
+      }
+    }
   }
+  console.error("[sendChat] all models overloaded");
+  return { reply: null };
 }
 
 export async function dbStatusAction(): Promise<{ db: boolean }> {
